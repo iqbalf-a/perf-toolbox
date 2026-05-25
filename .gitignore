@@ -1,0 +1,16 @@
+# Script folders (sample/working data)
+lr-bulk-indexer/script/
+lr-raw-indexer/input.c
+lr-raw-indexer/output.c
+lr-action-renamer/script/
+lr-snapshot-indexer/raw_snapshot.c
+lr-snapshot-indexer/output_snapshot.c
+lr-scenario-vuser/scenario_code.xml
+lr-scenario-vuser/output_scenario_code.xml
+
+# Backup files
+*.bak.*
+*.bak
+
+# Logs
+*.log
