@@ -94,6 +94,28 @@ function findUrlEndpoint(lines, startIdx) {
   return "unknown";
 }
 
+/**
+ * Parse default.usp → ordered action names, excluding vuser_init & vuser_end.
+ * Returns null if file not found or line absent.
+ */
+function readActionOrder(folderPath) {
+  const uspFile = path.join(folderPath, "default.usp");
+  if (!fs.existsSync(uspFile)) return null;
+  const content = fs.readFileSync(uspFile, "utf-8");
+  const m = content.match(/^Profile Actions name=(.+)$/m);
+  if (!m) return null;
+  return m[1]
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s && s !== "vuser_init" && s !== "vuser_end");
+}
+
+/** Find <actionName>.c inside folderPath, or null if not found. */
+function findScriptByAction(folderPath, actionName) {
+  const f = path.join(folderPath, `${actionName}.c`);
+  return fs.existsSync(f) ? f : null;
+}
+
 // ─── core processing ──────────────────────────────────────────────────────────
 
 /**
@@ -104,7 +126,7 @@ function findUrlEndpoint(lines, startIdx) {
  *   D: Logout("BP...")
  * Returns Map { oldName → newName } with sequential 2-digit step numbers.
  */
-function buildTxRenameMap(content, bpNum) {
+function buildTxRenameMap(content, bpNum, startStep = 1) {
   const map     = new Map();
   const entries = [];
 
@@ -120,7 +142,7 @@ function buildTxRenameMap(content, bpNum) {
   while ((m = reD.exec(content)) !== null) entries.push({ idx: m.index, name: m[1] });
   entries.sort((a, b) => a.idx - b.idx);
 
-  let step = 1;
+  let step = startStep;
   for (const { name } of entries) {
     if (map.has(name)) continue;
     let sem;
@@ -130,16 +152,16 @@ function buildTxRenameMap(content, bpNum) {
     map.set(name, `${bpNum}_${String(step).padStart(2, "0")}_${sem}`);
     step++;
   }
-  return map;
+  return { map, nextStep: step };
 }
 
 /**
  * Apply all renaming rules to file content.
  * Returns { content, txRenamed, webRenamed }.
  */
-function processContent(content, bpNum) {
-  const txMap = buildTxRenameMap(content, bpNum);
-  if (!txMap.size) return { content, txRenamed: 0, webRenamed: 0 };
+function processContent(content, bpNum, startStep = 1) {
+  const { map: txMap, nextStep } = buildTxRenameMap(content, bpNum, startStep);
+  if (!txMap.size) return { content, txRenamed: 0, webRenamed: 0, nextStep: startStep };
 
   const lines = content.split(/(?<=\n)/); // split but keep line endings
 
@@ -288,13 +310,14 @@ function processContent(content, bpNum) {
     result.push(line);
   }
 
-  return { content: result.join(""), txRenamed, webRenamed };
+  return { content: result.join(""), txRenamed, webRenamed, nextStep };
 }
 
 // ─── folder processing ────────────────────────────────────────────────────────
 
 /**
  * Process one BP* folder.
+ * Reads action order from default.usp and chains step numbers across actions.
  * Returns { skipped, txRenamed, webRenamed } for summary accumulation.
  */
 function processFolder(folderPath, dryRun) {
@@ -302,51 +325,82 @@ function processFolder(folderPath, dryRun) {
   const bpMatch    = folderName.match(/^(BP\d+)/i);
   const bpNum      = bpMatch ? bpMatch[1].toUpperCase() : folderName;
 
-  const scriptFile = findMainScript(folderPath);
-  if (!scriptFile) {
-    console.log(`  [${folderName}] SKIP — no .c script file found`);
+  // Build ordered list of script files from default.usp, fallback to findMainScript
+  const actions = readActionOrder(folderPath);
+  let scriptFiles; // [{ name, file }]
+
+  if (actions && actions.length) {
+    scriptFiles = [];
+    for (const name of actions) {
+      const file = findScriptByAction(folderPath, name);
+      if (!file) { console.log(`  [${folderName}] WARN — ${name}.c tidak ditemukan, dilewati`); continue; }
+      scriptFiles.push({ name, file });
+    }
+  } else {
+    const file = findMainScript(folderPath);
+    if (!file) {
+      console.log(`  [${folderName}] SKIP — no .c script file found`);
+      return { skipped: true, txRenamed: 0, webRenamed: 0 };
+    }
+    scriptFiles = [{ name: path.basename(file, ".c"), file }];
+  }
+
+  if (!scriptFiles.length) {
+    console.log(`  [${folderName}] SKIP — no script files found`);
     return { skipped: true, txRenamed: 0, webRenamed: 0 };
   }
 
-  console.log(`\n  [${folderName}]  file: ${path.basename(scriptFile)}`);
+  console.log(`\n  [${folderName}]  actions: ${scriptFiles.map((a) => a.name).join(", ")}`);
 
-  const original = fs.readFileSync(scriptFile, "utf-8");
-  const { content: updated, txRenamed, webRenamed } = processContent(original, bpNum);
+  let currentStep  = 1;
+  let totalTx      = 0;
+  let totalWeb     = 0;
 
-  if (updated === original) {
-    console.log("    No changes needed.");
-    return { skipped: false, txRenamed: 0, webRenamed: 0 };
-  }
+  for (const { name, file: scriptFile } of scriptFiles) {
+    const stepStart = currentStep;
+    const original  = fs.readFileSync(scriptFile, "utf-8");
+    const { content: updated, txRenamed, webRenamed, nextStep } = processContent(original, bpNum, currentStep);
+    currentStep = nextStep;
 
-  // Diff summary
-  const origLines    = original.split("\n");
-  const updatedLines = updated.split("\n");
-  const changed      = origLines.reduce((n, l, i) => n + (l !== updatedLines[i] ? 1 : 0), 0);
-  const extra        = Math.abs(origLines.length - updatedLines.length);
-  const totalChanges = changed + extra;
+    const stepLabel = nextStep > stepStart ? `step ${stepStart}–${nextStep - 1}` : `step ${stepStart}`;
+    console.log(`    [${name}.c]  ${stepLabel}`);
 
-  if (dryRun) {
-    let shown = 0;
-    for (let i = 0; i < Math.min(origLines.length, updatedLines.length); i++) {
-      if (origLines[i] !== updatedLines[i]) {
-        if (shown < 15) {
-          console.log(`    - ${origLines[i].trim()}`);
-          console.log(`    + ${updatedLines[i].trim()}`);
-        }
-        shown++;
-      }
+    if (updated === original) {
+      console.log("      No changes needed.");
+      continue;
     }
-    if (totalChanges > 15) console.log(`    ... and ${totalChanges - 15} more line(s)`);
-    console.log(`    [DRY RUN] tx:${txRenamed} renamed, web:${webRenamed} renamed, ${totalChanges} line(s) total`);
-    return { skipped: false, txRenamed: 0, webRenamed: 0 };
-  } else {
-    const backup = `${scriptFile}.bak.${timestamp()}`;
-    fs.copyFileSync(scriptFile, backup);
-    fs.writeFileSync(scriptFile, updated, "utf-8");
-    console.log(`    tx:${txRenamed} renamed, web:${webRenamed} renamed, ${totalChanges} line(s) changed`);
-    console.log(`    Backup → ${path.basename(backup)}`);
-    return { skipped: false, txRenamed, webRenamed };
+
+    const origLines    = original.split("\n");
+    const updatedLines = updated.split("\n");
+    const changed      = origLines.reduce((n, l, i) => n + (l !== updatedLines[i] ? 1 : 0), 0);
+    const extra        = Math.abs(origLines.length - updatedLines.length);
+    const totalChanges = changed + extra;
+
+    if (dryRun) {
+      let shown = 0;
+      for (let i = 0; i < Math.min(origLines.length, updatedLines.length); i++) {
+        if (origLines[i] !== updatedLines[i]) {
+          if (shown < 15) {
+            console.log(`      - ${origLines[i].trim()}`);
+            console.log(`      + ${updatedLines[i].trim()}`);
+          }
+          shown++;
+        }
+      }
+      if (totalChanges > 15) console.log(`      ... and ${totalChanges - 15} more line(s)`);
+      console.log(`      [DRY RUN] tx:${txRenamed} renamed, web:${webRenamed} renamed, ${totalChanges} line(s) total`);
+    } else {
+      const backup = `${scriptFile}.bak.${timestamp()}`;
+      fs.copyFileSync(scriptFile, backup);
+      fs.writeFileSync(scriptFile, updated, "utf-8");
+      console.log(`      tx:${txRenamed} renamed, web:${webRenamed} renamed, ${totalChanges} line(s) changed`);
+      console.log(`      Backup → ${path.basename(backup)}`);
+      totalTx  += txRenamed;
+      totalWeb += webRenamed;
+    }
   }
+
+  return { skipped: false, txRenamed: totalTx, webRenamed: totalWeb };
 }
 
 /**
@@ -354,28 +408,38 @@ function processFolder(folderPath, dryRun) {
  */
 function restoreFolder(folderPath) {
   const folderName = path.basename(folderPath);
-  const scriptFile = findMainScript(folderPath);
-  if (!scriptFile) {
-    console.log(`  [${folderName}] SKIP — no .c script file found`);
-    return;
+
+  const actions = readActionOrder(folderPath);
+  let scriptFiles;
+
+  if (actions && actions.length) {
+    scriptFiles = actions.map((name) => findScriptByAction(folderPath, name)).filter(Boolean);
+  } else {
+    const file = findMainScript(folderPath);
+    if (!file) {
+      console.log(`  [${folderName}] SKIP — no .c script file found`);
+      return;
+    }
+    scriptFiles = [file];
   }
 
-  const scriptBase = path.basename(scriptFile);
-  // Find all backup files: e.g. BP001.c.bak.20260521_143022
-  const backups = fs
-    .readdirSync(folderPath)
-    .filter((f) => f.startsWith(scriptBase + ".bak."))
-    .sort(); // alphabetical = chronological for YYYYMMDD_HHmmss
+  for (const scriptFile of scriptFiles) {
+    const scriptBase = path.basename(scriptFile);
+    const backups    = fs
+      .readdirSync(folderPath)
+      .filter((f) => f.startsWith(scriptBase + ".bak."))
+      .sort();
 
-  if (!backups.length) {
-    console.log(`  [${folderName}] No backup found for ${scriptBase}`);
-    return;
+    if (!backups.length) {
+      console.log(`  [${folderName}] No backup found for ${scriptBase}`);
+      continue;
+    }
+
+    const latest     = backups[backups.length - 1];
+    const backupPath = path.join(folderPath, latest);
+    fs.copyFileSync(backupPath, scriptFile);
+    console.log(`  [${folderName}] Restored ${scriptBase} from ${latest}`);
   }
-
-  const latest = backups[backups.length - 1];
-  const backupPath = path.join(folderPath, latest);
-  fs.copyFileSync(backupPath, scriptFile);
-  console.log(`  [${folderName}] Restored from ${latest}`);
 }
 
 // ─── CLI entry point ──────────────────────────────────────────────────────────
